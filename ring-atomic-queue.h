@@ -39,6 +39,18 @@
 #include <type_traits>
 #include <utility>
 
+#ifdef _WIN32
+  #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+  #endif
+  #ifndef NOMINMAX
+    #define NOMINMAX
+  #endif
+  #include <windows.h>
+#else
+  #include <time.h>
+#endif
+
 // ---------------------------------------------------------------------------
 // Simple CHECK macros (abort on failure, no messages).
 // ---------------------------------------------------------------------------
@@ -83,8 +95,18 @@ template <typename T> inline T prev_power_of_2(T x) { return PrevPower2Helper<T,
 // SpinLock - simplified standalone version using std::atomic<int>
 // ---------------------------------------------------------------------------
 namespace {
+#ifdef _WIN32
+    // Windows: Sleep() resolution is in milliseconds. With timeBeginPeriod(1)
+    // set process-wide, Sleep(1) is ~1 ms; without it, Sleep() is stuck at
+    // the ~15.6 ms scheduler quantum. Short wait is a thread yield.
+    static inline void spin_wait_short_sleep() { ::SwitchToThread(); }
+    static inline void spin_wait_long_sleep()  { ::Sleep(1); }
+#else
     static const struct timespec spin_wait_short = { 0, 1 };
     static const struct timespec spin_wait_long  = { 0, 10000001 };
+    static inline void spin_wait_short_sleep() { nanosleep(&spin_wait_short, nullptr); }
+    static inline void spin_wait_long_sleep()  { nanosleep(&spin_wait_long,  nullptr); }
+#endif
 }
 
 class SpinLock {
@@ -102,10 +124,10 @@ public:
             if (!(lock_.load(std::memory_order_relaxed) || lock_.exchange(1, std::memory_order_acquire))) return;
             if (!(lock_.load(std::memory_order_relaxed) || lock_.exchange(1, std::memory_order_acquire))) return;
             if (spin_count < 8) {
-                nanosleep(&spin_wait_short, nullptr);
+                spin_wait_short_sleep();
             } else {
                 spin_count = 0;
-                nanosleep(&spin_wait_long, nullptr);
+                spin_wait_long_sleep();
             }
         }
     }
@@ -127,7 +149,7 @@ public:
             if (!(lock_.load(std::memory_order_relaxed) || lock_.exchange(1, std::memory_order_acquire))) return true;
             if (!(lock_.load(std::memory_order_relaxed) || lock_.exchange(1, std::memory_order_acquire))) return true;
             if (spin_count < 8) {
-                nanosleep(&spin_wait_short, nullptr);
+                spin_wait_short_sleep();
             } else {
                 return false;
             }
@@ -184,9 +206,13 @@ class RingAtomicMapQueueMPMC {
         std::atomic<int> busy;      // In-flight commit: set under lock before unlock, cleared after key store/clear
         V value;
     };
+    // Key-only specialization: the key atomic alone carries the full slot
+    // state (zero = empty, non-zero = full). Since there is no value to
+    // construct/destruct, push/pop do the key store inside the lock and
+    // drop the busy flag entirely -- the critical section stays tiny
+    // (~3-4 cycles of actual work) and each slot shrinks by a cache line.
     template <typename K> struct alignas(std::max({ALIGN, alignof(std::atomic<K>)})) queue_slot_t<K, void> {
         std::atomic<K> key;
-        std::atomic<int> busy;      // In-flight commit: set under lock before unlock, cleared after key store/clear
     };
     using slot_t = queue_slot_t<Key, Value>;
 
@@ -246,6 +272,17 @@ class RingAtomicMapQueueMPMC {
     }
 
     // Push for key-only queue.
+    // Observing key==0 under the tail lock claims the slot: no other producer
+    // can land on it until the ring wraps, and consumers cannot advance head
+    // past a slot whose key is still 0 (pop treats key==0 as empty and bails).
+    // That means the store-release of the key -- the cross-lock handoff to
+    // the consumer -- is correct both inside and outside the critical section.
+    // We keep it inside the lock because the l.release()-before-store variant
+    // loses badly on Zen4 and Grace ARM (up to 8x throughput collapse at
+    // a64/a128 with 4+ threads), even though it wins ~2x on Cascade Lake at
+    // a0/a16.  Tested on gaudi (Cascade Lake 64t), flex7589 (Zen4 64t),
+    // cal-arm-21 (Grace ARM 72t) -- store-inside-lock is the only variant
+    // that delivers consistent throughput across all three architectures.
     template <typename V = void, REQUIRES(std::is_same_v<Value, V>)>
     bool push(Key key) {
         SpinLock::ScopeLock l(tail_.l);
@@ -253,14 +290,12 @@ class RingAtomicMapQueueMPMC {
         slot_t& slot = queue_[tail_.i & capacity_mask_];
         // If the slot is empty, we can enqueue and increment producer index.
         // Otherwise, the queue is full, bail out.
+        // NTRY retries tolerate a consumer that's currently draining this
+        // slot (tail wrapped into a slot whose clear-to-0 hasn't landed yet).
         for (size_t i = 0; i != NTRY; ++i) {
-            if (slot.key.load(std::memory_order_acquire) == Key{} &&
-                !slot.busy.load(std::memory_order_relaxed)) {
-                slot.busy.store(1, std::memory_order_relaxed);
-                ++tail_.i;
-                l.release();    // Atomic operations on queue slots are enough from now on
+            if (slot.key.load(std::memory_order_acquire) == Key{}) {
                 slot.key.store(key, std::memory_order_release);
-                slot.busy.store(0, std::memory_order_relaxed);
+                ++tail_.i;
                 return true;
             }
         }
@@ -291,20 +326,16 @@ class RingAtomicMapQueueMPMC {
         return Key{};
     }
 
-    // Pop for key-only queue.
+    // Pop for key-only queue. Mirror of key-only push; see that comment for
+    // why the clear-to-0 store sits inside the critical section.
     template <typename V = Value, REQUIRES(std::is_same_v<void, V>)>
     Key pop() {
         SpinLock::ScopeLock l(head_.l);
-        // Next slot to read the data from.
         slot_t& slot = queue_[head_.i & capacity_mask_];
-        // If the slot is not empty and not mid-commit, we can dequeue and empty it out.
         Key ret = slot.key.load(std::memory_order_acquire);
-        if (ret != Key{} && !slot.busy.load(std::memory_order_relaxed)) {
-            slot.busy.store(1, std::memory_order_relaxed);
-            ++head_.i;
-            l.release();    // Atomic operations on queue slots are enough from now on
+        if (ret != Key{}) {
             slot.key.store(Key{}, std::memory_order_release);
-            slot.busy.store(0, std::memory_order_relaxed);
+            ++head_.i;
             return ret;
         }
         return Key{};
