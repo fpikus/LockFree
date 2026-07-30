@@ -1,0 +1,18 @@
+#! /bin/bash
+#CXX=g++-13
+CXX=clang++-20
+GBENCH_DIR="$HOME/GoogleBench"
+OPTS="-march=native -mcx16"
+INCLUDES="-I . -I $GBENCH_DIR/include"
+LIBS="-L $GBENCH_DIR/lib/ -l benchmark -lpthread"
+CXXFLAGS="-O3 --std=c++23 -Wno-deprecated-declarations $OPTS"
+SRC=queue_gmbm.C
+echo "$CXX $CXXFLAGS $INCLUDES $SRC $LIBS -o ${SRC/.C/}"
+$CXX $CXXFLAGS $INCLUDES $SRC $LIBS -o ${SRC/.C/}
+
+INCLUDES="-I ."
+LIBS="-lpthread"
+for SRC in queue_mbm.C queue_lmbm.C queue_ppmbm.C ; do
+    echo "$CXX $CXXFLAGS $INCLUDES $SRC $LIBS -o ${SRC/.C/}"
+    $CXX $CXXFLAGS $INCLUDES $SRC $LIBS -o ${SRC/.C/}
+done
